@@ -1,0 +1,35 @@
+
+
+module.exports = {
+  TOKEN: "MTQ5MjU4MjY1ODk4MTc1NzA3MA.GkyCOW.xmkkgUfKdhHN9DQ-O17IZjFeIGuVGL0GabUeKU",
+  language: "en",
+  ownerID: ["1178546425018187820"], 
+  mongodbUri : "mongodb+srv://shiva:shiva@musicbotyt.ouljywv.mongodb.net/?retryWrites=true&w=majority",
+  spotifyClientId : "d92baed9605a45a39ed7c2a2d960b1c1",
+  spotifyClientSecret : "e9b29f6739de4315bc03b6d8a8e93b03",
+  setupFilePath: './commands/setup.json',
+  commandsDir: './commands',  
+  embedColor: "#e11d2e",
+  customEmoji: true,  // true = use custom emoji IDs from emoji.js, false = use default unicode
+  emojiTheme: "redwhite", // active custom emoji theme key in emoji.js
+  helpBannerUrl: "https://tenor.com/view/smt-shin-megami-tensei-online-demon-icon-persona-gif-536892381469164874", // Optional: set a direct image URL to show an inline banner in /help
+  activityName: "YouTube Music", 
+  activityType: "LISTENING",  // Available activity types : LISTENING , PLAYING
+  SupportServer: "https://discord.gg/g9YHwu7cKx",
+  embedTimeout: 5,
+  showProgressBar: false,  // Show progress bar in track embed
+  showVisualizer: false,  // Show visualizer on music card (disabled for low-memory optimization)
+  generateSongCard: true,  // custom song card image, if false uses thumbnail
+  metadataTag: true,  // If true, always show Song Details even when the card image is present
+  lowMemoryMode: true,   // Performance optimizations for low-memory environments (512MB RAM)
+  errorLog: "", 
+  nodes: [
+  {
+  name: "OGTomz",
+  password: "swlavapass",
+  host: "node.uoaio.xyz",
+  port: 20050,
+  secure: false
+}
+  ]
+}
