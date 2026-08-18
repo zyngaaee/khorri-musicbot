@@ -9,7 +9,7 @@ const axios = require('axios');
 const { autoplayCollection, playlistCollection } = require('./mongodb.js');
 const { initializeLavalinkManager, getLavalinkManager } = require('./lavalink.js');
 const { cardFromMessage, safeDeferUpdate, stripLeadingIcons, buildPaleCard } = require('./utils/responseHandler.js');
-const { patchPlayerPlay, setRiffyInstance } = require('./patchRiffy.js');
+const { normalizeSearchQuery } = require('./utils/musicSearch.js');
 
 let getLangSync, getLang;
 try {
@@ -25,8 +25,8 @@ const nowPlayingMessages = new Map();
 const progressUpdateIntervals = new Map();
 const guildActiveFilter = new Map();
 const guildTrackMediaCache = new Map();
-// Tracks guilds where a SoundCloud fallback is in progress (to suppress cascade skips)
-const scFallbackInProgress = new Set();
+const autoplayFallbackCooldowns = new Map();
+const AUTOPLAY_FALLBACK_COOLDOWN_MS = 30000;
 const musicCard = new EnhancedMusicCard();
 const useGeneratedSongCard = config.generateSongCard !== false;
 const enableVoiceChannelIdPatch = config.enableVoiceChannelIdPatch === true;
@@ -309,13 +309,6 @@ function buildNowPlayingContainer(track, requesterName, t, progressBar, progress
             .addActionRowComponents(actionRows.manageRow);
     }
 
-    if (actionRows?.filterRow) {
-        container
-            .addSeparatorComponents((separator) => separator)
-            .addTextDisplayComponents((textDisplay) => textDisplay.setContent(`### ${filterIcon} Effects`))
-            .addActionRowComponents(actionRows.filterRow);
-    }
-
     container
         .addSeparatorComponents((separator) => separator)
         .addTextDisplayComponents((textDisplay) => textDisplay.setContent(tryHint));
@@ -406,11 +399,6 @@ async function initializePlayer(client) {
     client.lavalinkManager = nodeManager;
     client.nodeManager = nodeManager;
 
-    // Apply runtime patch: auto-converts YouTube tracks to SoundCloud in Player.play()
-    // This survives npm install since it's applied at runtime, not to node_modules files
-    setRiffyInstance(client.riffy);
-    patchPlayerPlay();
-
     client.riffy.on("playerCreate", (player) => {
         if (enableVoiceChannelIdPatch) {
             patchVoiceChannelIdSupport(player);
@@ -434,45 +422,6 @@ async function initializePlayer(client) {
             console.error(`${colors.cyan}[ LAVALINK ]${colors.reset} ${colors.red}${langSync.console?.player?.trackException?.replace('{guildId}', player?.guildId || 'unknown').replace('{message}', errorMsg) || `Track Exception for guild ${player?.guildId || 'unknown'}: ${errorMsg}`}${colors.reset}`);
         }
 
-        console.error(`[ PLAYBACK ] Track error guild=${player?.guildId || 'unknown'} track=${track?.info?.title || 'unknown'} severity=${payload?.exception?.severity || 'unknown'} cause=${payload?.exception?.cause || 'unknown'}`);
-
-        // If YouTube stream failed due to YouTube IP block/login requirement, fallback to SoundCloud stream automatically
-        if (track?.info?.title && player && !player.destroyed) {
-            const guildId = player.guildId;
-            // Set flag BEFORE async SC lookup so that trackEnd (which fires simultaneously) knows not to cascade
-            scFallbackInProgress.add(guildId);
-            try {
-                const title = (track.info.title || '').replace(/\([^)]*\)|\[[^\]]*\]/g, '').trim();
-                const author = (track.info.author || '').replace(/ - Topic$/i, '').trim();
-                const scQuery = `${title} ${author}`.trim();
-                // Use source:'scsearch' — NOT 'scsearch:' prefix in query string (Riffy would double-prefix it)
-                const scRes = await client.riffy.resolve({ query: scQuery, source: 'scsearch', requester: track.info.requester || 'Fallback' }).catch(() => null);
-                if (scRes && scRes.tracks && scRes.tracks.length > 0) {
-                    // Prefer actual SoundCloud tracks, not YouTube results
-                    const fallbackTrack = scRes.tracks.find(t => t.info?.sourceName === 'soundcloud') || scRes.tracks[0];
-                    if (fallbackTrack) {
-                        fallbackTrack.info.requester = track.info.requester || 'Fallback';
-                        // Put SC track at the FRONT of the queue so it plays next
-                        player.queue.unshift(fallbackTrack);
-                        console.log(`[ FALLBACK ] Switched "${track.info.title}" → SoundCloud: "${fallbackTrack.info.title}" (${fallbackTrack.info.sourceName})`);
-                        // Wait a tick so trackEnd fires and clears player.playing before we call play()
-                        await new Promise(r => setTimeout(r, 150));
-                        const currentPlayer = client.riffy.players.get(guildId);
-                        if (currentPlayer && !currentPlayer.destroyed && !currentPlayer.playing && !currentPlayer.paused) {
-                            await currentPlayer.play().catch(() => {});
-                        }
-                    } else {
-                        console.warn(`[ FALLBACK ] No SoundCloud track found for "${track.info.title}", skipping`);
-                    }
-                } else {
-                    console.warn(`[ FALLBACK ] No SoundCloud results for "${track.info.title}", skipping`);
-                }
-            } catch (fallbackError) {
-                console.error('[ FALLBACK ] SoundCloud stream fallback error:', fallbackError.message || fallbackError);
-            } finally {
-                scFallbackInProgress.delete(guildId);
-            }
-        }
     });
 
     client.riffy.on("trackStuck", (player, track, payload) => {
@@ -694,22 +643,6 @@ async function initializePlayer(client) {
         console.log(`[ PLAYBACK ] Track ended guild=${guildId} track=${track?.info?.title || 'unknown'} reason=${payload?.reason || 'unknown'} queue=${player.queue.length}`);
         clearTrackMediaCache(guildId);
         
-        // If a SoundCloud fallback is in progress for this guild, don't advance the queue —
-        // trackError is handling it and will call player.play() itself after inserting the SC track.
-        if (scFallbackInProgress.has(guildId)) {
-            console.log(`[ FALLBACK ] trackEnd suppressed for guild=${guildId} — SC fallback in progress`);
-            // Still do status/cleanup but skip queue advancement
-            if (client.statusManager) {
-                await client.statusManager.onTrackEnd(guildId).catch(() => {});
-            }
-            clearProgressUpdates(guildId);
-            const nodeManager = getLavalinkManager();
-            if (nodeManager) {
-                await nodeManager.resetVoiceChannelStatus(guildId, player.voiceChannel);
-            }
-            return;
-        }
-        
         if (client.statusManager) {
             await client.statusManager.onTrackEnd(guildId).catch(() => {});
         }
@@ -782,26 +715,34 @@ async function initializePlayer(client) {
                 if (!autoplaySuccess && player.previous?.info) {
                     try {
                         const prev = player.previous.info;
-                        const queries = [
-                            `ytsearch:${prev.title} ${prev.author}`,
-                            `ytsearch:${prev.title}`
-                        ];
+                        const fallbackKey = `${guildId}:${normalizeSearchQuery(`${prev.title} ${prev.author}`).toLowerCase()}`;
+                        const cooldownUntil = autoplayFallbackCooldowns.get(fallbackKey) || 0;
+                        if (Date.now() >= cooldownUntil) {
+                            autoplayFallbackCooldowns.set(fallbackKey, Date.now() + AUTOPLAY_FALLBACK_COOLDOWN_MS);
 
-                        for (const q of queries) {
-                            const res = await client.riffy.resolve({ query: q, requester: prev.requester || 'Autoplay' }).catch(() => null);
-                            if (res && res.tracks && res.tracks.length > 0) {
-                                const candidate = res.tracks.find(tr => tr.info.identifier !== prev.identifier && tr.info.uri !== prev.uri) || res.tracks[0];
-                                if (candidate) {
-                                    candidate.info.requester = prev.requester || 'Autoplay';
-                                    player.queue.add(candidate);
-                                    if (!player.playing && !player.paused) {
-                                        await player.play().catch(() => {});
+                            const queries = [
+                                normalizeSearchQuery(`${prev.title} ${prev.author}`),
+                                normalizeSearchQuery(prev.title)
+                            ].filter(Boolean);
+
+                            for (const q of queries) {
+                                const res = await client.riffy.resolve({ query: q, requester: prev.requester || 'Autoplay' }).catch(() => null);
+                                if (res && res.tracks && res.tracks.length > 0) {
+                                    const candidate = res.tracks.find(tr => tr.info.identifier !== prev.identifier && tr.info.uri !== prev.uri) || res.tracks[0];
+                                    if (candidate) {
+                                        candidate.info.requester = prev.requester || 'Autoplay';
+                                        player.queue.add(candidate);
+                                        if (!player.playing && !player.paused) {
+                                            await player.play().catch(() => {});
+                                        }
+                                        autoplaySuccess = true;
+                                        console.log(`[ AUTOPLAY ] Successfully queued fallback autoplay track: ${candidate.info.title}`);
+                                        break;
                                     }
-                                    autoplaySuccess = true;
-                                    console.log(`[ AUTOPLAY ] Successfully queued fallback autoplay track: ${candidate.info.title}`);
-                                    break;
                                 }
                             }
+                        } else {
+                            console.warn(`[ AUTOPLAY ] Skipping fallback search for ${guildId} due to cooldown`);
                         }
                     } catch (fallbackErr) {
                         console.error('[ AUTOPLAY ] Fallback search error:', fallbackErr.message || fallbackErr);
@@ -1132,14 +1073,17 @@ function setupCollector(client, closedPlayer, channel, message) {
                     await playlistCommand.run(client, mockInteraction);
                     await i.deferUpdate().catch(() => {});
                 } else {
-                    const sent = await channel.send({ content: '📋 Type `/playlist menu` to open the playlist menu!' });
-                    setTimeout(() => sent.delete().catch(() => {}), 10000);
+                    // playlist command not found, show error
+                    const errCard = cardFromMessage(`${getEmoji('error') || '❌'} **Playlist command not found.**`, 'Playlist');
+                    const sent = await channel.send({ components: [errCard], flags: MessageFlags.IsComponentsV2 });
+                    setTimeout(() => sent.delete().catch(() => {}), 6000);
                     await i.deferUpdate().catch(() => {});
                 }
             } catch (error) {
                 console.error('Playlist button error:', error);
-                const sent = await channel.send({ content: '📋 Type `/playlist menu` to open the playlist menu!' });
-                setTimeout(() => sent.delete().catch(() => {}), 10000);
+                const errCard = cardFromMessage(`${getEmoji('error') || '❌'} **Could not open playlist menu.**`, 'Playlist');
+                const sent = await channel.send({ components: [errCard], flags: MessageFlags.IsComponentsV2 });
+                setTimeout(() => sent.delete().catch(() => {}), 6000);
                 await i.deferUpdate().catch(() => {});
             }
             return;
@@ -1203,7 +1147,7 @@ function setupCollector(client, closedPlayer, channel, message) {
                     return;
                 }
 
-                const cleanQuery = cleanSearchQuery(query);
+                const cleanQuery = normalizeSearchQuery(query);
                 const resolve = await client.riffy.resolve({ query: cleanQuery, requester: i.user.username });
                 if (!resolve || !Array.isArray(resolve.tracks) || !resolve.tracks.length) {
                     const errCard = cardFromMessage('❌ **Could not resolve the selected favorite song.**', 'Play Error');
@@ -1343,86 +1287,6 @@ async function handleInteraction(client, i, player, channel) {
                 await sendEmbed(channel, t.controls?.resumeError || '⚠️ **Failed to change playback state. Please try again.**');
             }
             break;
-        case 'player_favorite': {
-            try {
-                const current = player.current?.info;
-                if (!current?.uri) {
-                    await sendEmbed(channel, '❌ **No active song to favorite.**');
-                    return;
-                }
-
-                const userId = i.user.id;
-                const serverId = channel.guild.id;
-                const serverName = channel.guild.name;
-                const playlistName = PLAYER_FAVORITES_NAME;
-                const legacyPlaylistName = `${LEGACY_PLAYER_FAVORITES_NAME}_${userId}`;
-                let existing = await playlistCollection.findOne({ name: playlistName, userId, serverId });
-
-                if (!existing) {
-                    const legacy = await playlistCollection.findOne({ name: legacyPlaylistName, userId, serverId });
-                    if (legacy) {
-                        await playlistCollection.updateOne(
-                            { _id: legacy._id },
-                            { $set: { name: playlistName, isPrivate: true } }
-                        );
-                        existing = await playlistCollection.findOne({ _id: legacy._id });
-                    }
-                }
-
-                if (!existing) {
-                    await playlistCollection.insertOne({
-                        name: playlistName,
-                        songs: [],
-                        isPrivate: true,
-                        userId,
-                        serverId,
-                        serverName
-                    });
-                }
-
-                const songEntry = { url: current.uri, name: current.title || 'Unknown Title' };
-                const updatedExisting = await playlistCollection.findOne({ name: playlistName, userId, serverId });
-                const songExists = updatedExisting && updatedExisting.songs && updatedExisting.songs.some(s => s.url === current.uri);
-
-                if (!songExists) {
-                    await playlistCollection.updateOne(
-                        { name: playlistName, userId, serverId },
-                        { $push: { songs: songEntry } }
-                    );
-                }
-
-                await sendEmbed(channel, '✅ **Added to Favorites.**');
-            } catch (error) {
-                await sendEmbed(channel, '⚠️ **Failed to add favorite.**');
-            }
-            break;
-        }
-        case 'player_filter_select': {
-            const selectedFilter = i.values?.[0];
-            if (selectedFilter === '__clear__') {
-                player.filters.clearFilters();
-                guildActiveFilter.delete(player.guildId);
-                await refreshNowPlayingPanel(client, player.guildId);
-                await sendEmbed(channel, '🧹 **Filters cleared.**');
-                break;
-            }
-            const applied = await applyFilterByKey(player, selectedFilter);
-            if (!applied) {
-                await sendEmbed(channel, '⚠️ **Invalid filter selection.**');
-                return;
-            }
-            guildActiveFilter.set(player.guildId, selectedFilter);
-            await refreshNowPlayingPanel(client, player.guildId);
-            await sendEmbed(channel, `🎛️ **Filter applied:** ${selectedFilter}`);
-            break;
-        }
-        case 'player_filter_clear': {
-            player.filters.clearFilters();
-            guildActiveFilter.delete(player.guildId);
-            await refreshNowPlayingPanel(client, player.guildId);
-            await sendEmbed(channel, '🧹 **Filters cleared.**');
-            break;
-        }
         case 'player_queue': {
             if (!player.queue.length) {
                 await sendEmbed(channel, '💭 **Queue is empty.**');
@@ -1552,7 +1416,7 @@ async function handlePlayerModalSubmit(client, modal, player, channel) {
                 return;
             }
 
-            const cleanQuery = cleanSearchQuery(query);
+            const cleanQuery = normalizeSearchQuery(query);
             const resolve = await client.riffy.resolve({ query: cleanQuery, requester: modal.user.username });
             if (!resolve || !Array.isArray(resolve.tracks) || !resolve.tracks.length) {
                 await modal.editReply({ content: '❌ No results found for that query.' }).catch(() => {});
@@ -1861,9 +1725,7 @@ function createPlaybackActionRow(disabled, paused = false, loopMode = 'none') {
     const pauseEmoji = getButtonEmoji('pause') || '⏸️';
     const skipEmoji = getButtonEmoji('next') || '⏭️';
     const volumeEmoji = getButtonEmoji('volume') || '🔊';
-    const loopEmoji = getButtonEmoji('settings') || '🔁';
     const stopEmoji = getButtonEmoji('stop') || '⏹️';
-    const loopEnabled = loopMode !== 'none';
     const playbackEmoji = paused ? playEmoji : pauseEmoji;
     const playbackLabel = paused ? 'Play' : 'Pause';
     const playbackStyle = paused ? ButtonStyle.Success : ButtonStyle.Secondary;
@@ -1873,51 +1735,29 @@ function createPlaybackActionRow(disabled, paused = false, loopMode = 'none') {
             new ButtonBuilder().setCustomId("togglePlayback").setEmoji(playbackEmoji).setLabel(playbackLabel).setStyle(playbackStyle).setDisabled(disabled),
             new ButtonBuilder().setCustomId("skipTrack").setEmoji(skipEmoji).setLabel("Skip").setStyle(ButtonStyle.Secondary).setDisabled(disabled),
             new ButtonBuilder().setCustomId('player_volume').setEmoji(volumeEmoji).setLabel('Volume').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
-            new ButtonBuilder().setCustomId("loopToggle").setEmoji(loopEmoji).setLabel("Loop").setStyle(loopEnabled ? ButtonStyle.Success : ButtonStyle.Secondary).setDisabled(disabled),
             new ButtonBuilder().setCustomId("stopTrack").setEmoji(stopEmoji).setLabel("Stop").setStyle(ButtonStyle.Danger).setDisabled(disabled)
         );
 }
 
-function createManageSongActionRow(disabled) {
+function createManageSongActionRow(disabled, loopMode = 'none') {
     const addEmoji = getButtonEmoji('playlist') || '📋';
     const shuffleEmoji = getButtonEmoji('servers') || '🌐';
     const queueEmoji = getButtonEmoji('queue') || '📄';
-    const favoriteEmoji = '⭐';
-    const playFavsEmoji = '📂';
+    const loopEmoji = getButtonEmoji('settings') || '🔁';
+    const loopEnabled = loopMode !== 'none';
 
     return new ActionRowBuilder().addComponents(
         new ButtonBuilder().setCustomId('player_playlist').setEmoji(addEmoji).setLabel('Playlist').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
         new ButtonBuilder().setCustomId('player_shuffle').setEmoji(shuffleEmoji).setLabel('Shuffle').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
         new ButtonBuilder().setCustomId('player_queue').setEmoji(queueEmoji).setLabel('Queue').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
-        new ButtonBuilder().setCustomId('player_favorite').setEmoji(favoriteEmoji).setLabel('Fav').setStyle(ButtonStyle.Secondary).setDisabled(disabled),
-        new ButtonBuilder().setCustomId('player_play_favorites').setEmoji(playFavsEmoji).setLabel('Play Favs').setStyle(ButtonStyle.Secondary).setDisabled(disabled)
+        new ButtonBuilder().setCustomId('loopToggle').setEmoji(loopEmoji).setLabel('Loop').setStyle(loopEnabled ? ButtonStyle.Success : ButtonStyle.Secondary).setDisabled(disabled)
     );
 }
 
-function createFilterRow(disabled, activeFilter = null) {
-    const select = new StringSelectMenuBuilder()
-        .setCustomId('player_filter_select')
-        .setPlaceholder(activeFilter ? `Filter: ${activeFilter}` : 'Select audio filter')
-        .setDisabled(disabled)
-        .addOptions(
-            [
-                { label: 'Clear Filters', value: '__clear__' },
-                ...PLAYER_FILTER_OPTIONS
-            ].map((item) => ({
-                label: item.label,
-                value: item.value,
-                default: item.value === activeFilter
-            }))
-        );
-
-    return new ActionRowBuilder().addComponents(select);
-}
-
-function buildPlayerActionRows(paused, loopMode, activeFilter) {
+function buildPlayerActionRows(paused, loopMode) {
     return {
         playbackRow: createPlaybackActionRow(false, paused, loopMode),
-        manageRow: createManageSongActionRow(false),
-        filterRow: createFilterRow(false, activeFilter)
+        manageRow: createManageSongActionRow(false, loopMode)
     };
 }
 

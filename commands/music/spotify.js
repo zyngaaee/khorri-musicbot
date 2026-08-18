@@ -23,6 +23,7 @@ const {
     fetchPlaylistTracksForUser
 } = require('../../utils/spotifyOAuth.js');
 const { extractSpotifyUserId, getSpotifyProfilePageName } = require('../../utils/spotify.js');
+const { normalizeSearchQuery } = require('../../utils/musicSearch.js');
 
 const data = new SlashCommandBuilder()
     .setName('spotify')
@@ -68,19 +69,7 @@ function trimText(value, maxLength = 220, fallback = 'No description provided.')
 }
 
 function cleanSearchQuery(query) {
-    if (!query || typeof query !== 'string') return '';
-    if (query.startsWith('http://') || query.startsWith('https://')) return query;
-
-    return query
-        .replace(/\s*-\s*Unknown\s*Artist/gi, '')
-        .replace(/\s*-\s*Unknown/gi, '')
-        .replace(/\bUnknown\s*Artist\b/gi, '')
-        .replace(/\bUnknown\b/gi, '')
-        .replace(/-/g, ' ')
-        .replace(/,/g, ' ')
-        .replace(/[()""']/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+    return normalizeSearchQuery(query);
 }
 
 function getButtonEmojiValue(key) {

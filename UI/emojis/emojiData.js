@@ -19,6 +19,7 @@ const REDWHITE_CUSTOMS = Object.freeze({
     next: { name: "sright", id: "1492584240339091456" },
     back: { name: "sleft", id: "1492583859903139952" },
     settings: { name: "ssetting", id: "1492584258299105380" },
+    loop: { name: "ssetting", id: "1492584258299105380" },
     tools: { name: "stools", id: "1492584346022973450" },
     success: { name: "stick", id: "1492584312544038933" },
     error: { name: "scross", id: "1492583503563325572" },
@@ -34,6 +35,7 @@ const REDWHITE_CUSTOMS = Object.freeze({
     welcome: { name: "sheart", id: "1492583749467111424" },
     owner: { name: "sowner", id: "1492584073606987806" },
     shuffle: { name: "sworld", id: "1492584365241139393" },
+    skip: { name: "sright", id: "1492584240339091456" },
     folder: { name: "sfolder1", id: "1492583605308882974" },
     cloud: { name: "scloud", id: "1492583461557375118" }
 });
@@ -59,6 +61,8 @@ const EMOJIS = Object.freeze({
     next: { default: "⏭️", custom: { redwhite: REDWHITE_CUSTOMS.next } },
     back: { default: "⏮️", custom: { redwhite: REDWHITE_CUSTOMS.back } },
     settings: { default: "⚙️", custom: { redwhite: REDWHITE_CUSTOMS.settings } },
+    loop: { default: "🔁", custom: { redwhite: REDWHITE_CUSTOMS.loop } },
+    skip: { default: "⏭️", custom: { redwhite: REDWHITE_CUSTOMS.skip } },
     tools: { default: "🛠️", custom: { redwhite: REDWHITE_CUSTOMS.tools } },
     success: { default: "✅", custom: { redwhite: REDWHITE_CUSTOMS.success } },
     error: { default: "❌", custom: { redwhite: REDWHITE_CUSTOMS.error } },

@@ -669,7 +669,7 @@ class LavalinkNodeManager {
             if (!voiceChannel) return;
             
             // This updates the "Listening to..." status in the voice channel
-            const statusText = `🎶 ${songTitle}${artist ? ` by ${artist}` : ''}`;
+            const statusText = `<a:song1:1535228249804775485> ${songTitle}${artist ? ` by ${artist}` : ''}`;
             
             // Update voice channel session status (max 128 chars)
             await this.setVoiceStatusValue(voiceChannel, statusText.substring(0, 128));

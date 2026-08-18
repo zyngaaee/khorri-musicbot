@@ -8,7 +8,11 @@ const { checkVoiceChannel: checkVC } = require('../../utils/voiceChannelCheck.js
 const { getLavalinkManager } = require('../../lavalink.js');
 const { getLang } = require('../../utils/languageLoader');
 const { getEmoji } = require('../../UI/emojis/emoji');
+const { normalizeSearchQuery, isValidSpotifyId, extractSpotifyResource, getSpotifySearchFallbackText } = require('../../utils/musicSearch.js');
 const requesters = new Map();
+const inFlightSearches = new Map();
+const recentSearchFailures = new Map();
+const SEARCH_FAILURE_COOLDOWN_MS = 15000;
 
 function formatDuration(ms) {
     const seconds = Math.floor((ms / 1000) % 60);
@@ -25,110 +29,75 @@ function formatDuration(ms) {
 }
 
 function cleanSearchQuery(query) {
-    if (!query || typeof query !== 'string') return '';
-    if (query.startsWith('http://') || query.startsWith('https://')) return query;
-
-    return query
-        .replace(/\s*-\s*Unknown\s*Artist/gi, '')
-        .replace(/\s*-\s*Unknown/gi, '')
-        .replace(/\bUnknown\s*Artist\b/gi, '')
-        .replace(/\bUnknown\b/gi, '')
-        .replace(/-/g, ' ')
-        .replace(/,/g, ' ')
-        .replace(/[()""']/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
-}
-
-// Convert a single track object to a SoundCloud track. Returns original if SC lookup fails.
-async function convertTrackToSC(client, track, requester) {
-    if (!track || !track.info) return track;
-    const sourceName = track.info.sourceName || '';
-    const uri = track.info.uri || '';
-    // Only convert YouTube tracks
-    if (sourceName !== 'youtube' && !/(?:youtube\.com|youtu\.be)/i.test(uri)) return track;
-    try {
-        const title = (track.info.title || '').replace(/\([^)]*\)|\[[^\]]*\]/g, '').trim();
-        const author = (track.info.author || '').replace(/ - Topic$/i, '').trim();
-        const scQuery = `${title} ${author}`.trim();
-        // Use source:'scsearch' so Riffy builds 'scsearch:<query>' correctly without double-prefix
-        const scRes = await client.riffy.resolve({ query: scQuery, source: 'scsearch', requester: requester || 'SC-Fallback' }).catch(() => null);
-        if (scRes && scRes.tracks && scRes.tracks.length > 0) {
-            // Verify the result is actually a SoundCloud track, not YouTube
-            const candidate = scRes.tracks.find(t => t.info?.sourceName === 'soundcloud') || scRes.tracks[0];
-            if (candidate) {
-                candidate.info.requester = track.info.requester || requester;
-                console.log(`[ SC ] Converted "${track.info.title}" → SC: "${candidate.info.title}" (${candidate.info.sourceName})`);
-                return candidate;
-            }
-        }
-    } catch (e) {}
-    return track;
+    return normalizeSearchQuery(query);
 }
 
 async function resolvePlayableTrack(client, query, requester) {
-    const isUrl = /^https?:\/\//i.test(query);
-    const isYouTubeUrl = /(?:youtube\.com|youtu\.be)/i.test(query);
-
-    if (isYouTubeUrl) {
-        try {
-            const ytResult = await client.riffy.resolve({ query, requester }).catch(() => null);
-            if (ytResult && ytResult.tracks && ytResult.tracks.length > 0) {
-                if (ytResult.loadType === 'playlist') {
-                    // For playlists: convert first track to SC immediately so playback starts
-                    // Remaining tracks are returned as YouTube (will be converted when queued)
-                    const converted = await convertTrackToSC(client, ytResult.tracks[0], requester);
-                    ytResult.tracks[0] = converted;
-                    return ytResult;
-                }
-                // Single YouTube URL: convert to SoundCloud
-                const converted = await convertTrackToSC(client, ytResult.tracks[0], requester);
-                if (converted !== ytResult.tracks[0]) {
-                    console.log(`[ PLAY ] Converted YouTube URL "${ytResult.tracks[0].info?.title}" to SoundCloud stream`);
-                    return { loadType: 'search', tracks: [converted] };
-                }
-                return ytResult;
-            }
-        } catch (e) {
-            console.warn(`[ PLAY ] YouTube URL resolve error for ${query}: ${e.message || e}`);
-        }
-    }
-
-    if (isUrl) {
-        try {
-            const urlResult = await client.riffy.resolve({ query, requester });
-            if (urlResult && urlResult.tracks && urlResult.tracks.length > 0) {
-                return urlResult;
-            }
-        } catch (e) {
-            console.warn(`[ PLAY ] Direct URL resolve error for ${query}: ${e.message || e}`);
-        }
-    }
-
     const searchQuery = cleanSearchQuery(query);
-    
-    // 1. Try SoundCloud search first (use source param so Riffy doesn't double-prefix)
-    try {
-        const scResult = await client.riffy.resolve({ query: searchQuery, source: 'scsearch', requester });
-        if (scResult && scResult.tracks && scResult.tracks.length > 0) {
-            // Prefer tracks with soundcloud sourceName
-            const scTrack = scResult.tracks.find(t => t.info?.sourceName === 'soundcloud') || scResult.tracks[0];
-            return { ...scResult, tracks: [scTrack] };
-        }
-    } catch (e) {}
+    if (!searchQuery) return null;
 
-    // 2. Try YouTube search as fallback (result will be converted to SC when played)
-    try {
-        const ytResult = await client.riffy.resolve({ query: searchQuery, source: 'ytsearch', requester });
-        if (ytResult && ytResult.tracks && ytResult.tracks.length > 0) {
-            // Convert the search result to SC immediately
-            const converted = await convertTrackToSC(client, ytResult.tracks[0], requester);
-            return { loadType: 'search', tracks: [converted] };
-        }
-    } catch (e) {}
+    const cacheKey = searchQuery.toLowerCase();
+    const recentFailureAt = recentSearchFailures.get(cacheKey);
+    if (recentFailureAt && Date.now() - recentFailureAt < SEARCH_FAILURE_COOLDOWN_MS) {
+        console.warn(`[ PLAY ] Skipping repeated resolve for "${searchQuery}" due to recent failure`);
+        return null;
+    }
 
-    // 3. Final default resolve fallback
-    return client.riffy.resolve({ query: searchQuery, requester }).catch(() => null);
+    if (inFlightSearches.has(cacheKey)) {
+        return inFlightSearches.get(cacheKey);
+    }
+
+    const task = (async () => {
+        const isUrl = /^https?:\/\//i.test(searchQuery);
+
+        if (isUrl) {
+            try {
+                const urlResult = await client.riffy.resolve({ query: searchQuery, requester });
+                if (urlResult && urlResult.tracks && urlResult.tracks.length > 0) {
+                    return urlResult;
+                }
+            } catch (e) {
+                console.warn(`[ PLAY ] Direct URL resolve error for ${searchQuery}: ${e.message || e}`);
+            }
+        }
+
+        try {
+            const result = await client.riffy.resolve({ query: searchQuery, requester });
+            if (result && result.tracks && result.tracks.length > 0) {
+                return result;
+            }
+        } catch (e) {
+            console.warn(`[ PLAY ] Default resolve error for ${searchQuery}: ${e.message || e}`);
+        }
+
+        try {
+            const scResult = await client.riffy.resolve({ query: searchQuery, source: 'scsearch', requester });
+            if (scResult && scResult.tracks && scResult.tracks.length > 0) {
+                return scResult;
+            }
+        } catch (e) {
+            console.warn(`[ PLAY ] SoundCloud fallback resolve error for ${searchQuery}: ${e.message || e}`);
+        }
+
+        return null;
+    })();
+
+    inFlightSearches.set(cacheKey, task);
+
+    try {
+        const result = await task;
+        if (result && Array.isArray(result.tracks) && result.tracks.length > 0) {
+            recentSearchFailures.delete(cacheKey);
+            return result;
+        }
+        recentSearchFailures.set(cacheKey, Date.now());
+        return result;
+    } catch (e) {
+        recentSearchFailures.set(cacheKey, Date.now());
+        throw e;
+    } finally {
+        inFlightSearches.delete(cacheKey);
+    }
 }
 
 const data = new SlashCommandBuilder()
@@ -287,6 +256,10 @@ async function getSpotifyAlbumTracksFallback(albumId) {
 }
 
 async function getSpotifyTrack(trackId) {
+    if (!isValidSpotifyId(trackId)) {
+        return null;
+    }
+
     try {
         const data = await spotifyApi.clientCredentialsGrant();
         spotifyApi.setAccessToken(data.body.access_token);
@@ -301,6 +274,10 @@ async function getSpotifyTrack(trackId) {
 }
 
 async function getSpotifyTrackFallback(trackId) {
+    if (!isValidSpotifyId(trackId)) {
+        return null;
+    }
+
     const trackUrl = `https://open.spotify.com/track/${trackId}`;
     try {
         const { getPreview } = require('spotify-url-info')(require('node-fetch'));
@@ -395,7 +372,7 @@ module.exports = {
 
             const lang = await getLang(interaction.guildId);
             const t = lang.music.play;
-            const query = interaction.options.getString('name');
+            let query = interaction.options.getString('name');
             const existingPlayer = client.riffy.players.get(interaction.guildId);
             const voiceCheck = await checkVC(interaction, existingPlayer);
             if (!voiceCheck.allowed) {
@@ -496,23 +473,21 @@ module.exports = {
             let tracksToQueue = [];
             let isPlaylist = false;
 
-            if (query.includes('spotify.com')) {
+            const spotifyResource = extractSpotifyResource(query);
+            const isSpotifyUrl = query.includes('spotify.com');
+            if (isSpotifyUrl && spotifyResource && isValidSpotifyId(spotifyResource.id)) {
                 try {
-                    let spotifyType = null;
-                    let spotifyId = null;
-
-                    // Parse Spotify URL directly to get the type and ID
-                    const match = query.match(/spotify\.com\/(playlist|track|album)\/([^/?#]+)/);
-                    if (match) {
-                        spotifyType = match[1];
-                        spotifyId = match[2];
-                    }
+                    let spotifyType = spotifyResource.type;
+                    let spotifyId = spotifyResource.id;
 
                     if (!spotifyType || !spotifyId) {
-                        // Fallback to spotify-url-info if URL structure is unusual
                         const spotifyData = await getData(query);
                         spotifyType = spotifyData.type;
                         spotifyId = spotifyData.id || query.split(`/${spotifyType}/`)[1]?.split('?')[0];
+                    }
+
+                    if (!isValidSpotifyId(spotifyId)) {
+                        throw new Error('Invalid Spotify identifier');
                     }
 
                     if (spotifyType === 'track') {
@@ -533,16 +508,14 @@ module.exports = {
                         throw new Error(`Unsupported Spotify type: ${spotifyType}`);
                     }
                 } catch (err) {
-                    console.error('Error fetching Spotify data:', err);
-                    return sendErrorResponse(
-                        interaction,
-                        t.spotifyError.title + '\n\n' +
-                        t.spotifyError.message + '\n' +
-                        t.spotifyError.note,
-                        5000
-                    );
+                    console.warn('[ PLAY ] Spotify lookup failed, falling back to text search:', err.message || err);
+                    query = getSpotifySearchFallbackText(query);
                 }
-            } else {
+            } else if (isSpotifyUrl) {
+                query = getSpotifySearchFallbackText(query);
+            }
+
+            if (!query.includes('spotify.com') || !tracksToQueue.length) {
                 let resolve;
                 const searchQuery = cleanSearchQuery(query);
                 try {
@@ -572,32 +545,10 @@ module.exports = {
 
                 if (resolve.loadType === 'playlist') {
                     isPlaylist = true;
-                    // First track is already SC-converted in resolvePlayableTrack; add it directly
-                    if (resolve.tracks.length > 0) {
-                        resolve.tracks[0].info.requester = interaction.user.username;
-                        player.queue.add(resolve.tracks[0]);
-                        requesters.set(resolve.tracks[0].info.uri, interaction.user.username);
-                    }
-                    // Convert remaining YouTube playlist tracks to SoundCloud in background
-                    const remainingPlaylistTracks = resolve.tracks.slice(1);
-                    if (remainingPlaylistTracks.length > 0) {
-                        (async () => {
-                            const batchSize = 3;
-                            for (let bi = 0; bi < remainingPlaylistTracks.length; bi += batchSize) {
-                                const currentPlayer = client.riffy.players.get(interaction.guildId);
-                                if (!currentPlayer || currentPlayer.destroyed) break;
-                                const batch = remainingPlaylistTracks.slice(bi, bi + batchSize);
-                                const converted = await Promise.all(batch.map(t => convertTrackToSC(client, t, interaction.user.username)));
-                                for (const t of converted) {
-                                    if (t) {
-                                        t.info.requester = interaction.user.username;
-                                        player.queue.add(t);
-                                        requesters.set(t.info.uri, interaction.user.username);
-                                    }
-                                }
-                                await new Promise(r => setTimeout(r, 200));
-                            }
-                        })();
+                    for (const track of resolve.tracks) {
+                        track.info.requester = interaction.user.username;
+                        player.queue.add(track);
+                        requesters.set(track.info.uri, interaction.user.username);
                     }
                 } else if (resolve.loadType === 'search' || resolve.loadType === 'track') {
                     const track = resolve.tracks.shift();

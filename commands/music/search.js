@@ -5,6 +5,7 @@ const { checkVoiceChannel: checkVC } = require('../../utils/voiceChannelCheck.js
 const { getLavalinkManager } = require('../../lavalink.js');
 const { getLang } = require('../../utils/languageLoader');
 const { getEmoji, getButtonEmoji } = require('../../UI/emojis/emoji');
+const { normalizeSearchQuery } = require('../../utils/musicSearch.js');
 
 const data = new SlashCommandBuilder()
   .setName("search")
@@ -30,19 +31,7 @@ function formatDuration(ms) {
 }
 
 function cleanSearchQuery(query) {
-    if (!query || typeof query !== 'string') return '';
-    if (query.startsWith('http://') || query.startsWith('https://')) return query;
-
-    return query
-        .replace(/\s*-\s*Unknown\s*Artist/gi, '')
-        .replace(/\s*-\s*Unknown/gi, '')
-        .replace(/\bUnknown\s*Artist\b/gi, '')
-        .replace(/\bUnknown\b/gi, '')
-        .replace(/-/g, ' ')
-        .replace(/,/g, ' ')
-        .replace(/[()""']/g, ' ')
-        .replace(/\s+/g, ' ')
-        .trim();
+    return normalizeSearchQuery(query);
 }
 
 module.exports = {
