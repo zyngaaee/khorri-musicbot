@@ -3,6 +3,8 @@
 
 An advanced Discord music bot built with Discord.js, Lavalink, and Riffy. It supports music playback, playlists, Spotify linking, queue controls, voice controls, and utility commands.
 
+A project by Lumeo Org.
+
 ## Features
 
 - Music playback with `/play`, `/search`, `/queue`, `/skip`, `/pause`, `/resume`, `/stop`, `/seek`, `/volume`, `/shuffle`, `/move`, `/jump`, `/remove`, `/disconnect`
