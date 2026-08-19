@@ -107,12 +107,6 @@ Utility:
 - `/language`
 - `/247`
 
-## Notes
-
-- `config.js` is ignored by Git, so your secrets stay local.
-- The bot uses Lavalink through Riffy for playback.
-- If YouTube playback fails on a node, check the Lavalink server and YouTube plugin first.
-
 ## License
 
 MIT
